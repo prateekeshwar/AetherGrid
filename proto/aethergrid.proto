@@ -1,0 +1,341 @@
+// AetherGrid v2.0 - Protocol Buffer Definitions
+// 
+// This schema defines all message types for:
+// - Raft consensus protocol
+// - Task orchestration (process table)
+// - Worker coordination with fencing tokens
+// - Deterministic log-based leases
+
+syntax = "proto3";
+
+package aethergrid;
+
+// ============== Core Types ==============
+
+// Unique identifier for a task
+message TaskID {
+    uint64 shard = 1;      // Which shard owns this task
+    uint64 sequence = 2;   // Monotonic sequence within shard
+}
+
+// Unique identifier for a node
+message NodeID {
+    string id = 1;  // UUID or hostname
+}
+
+// Resource specification for tasks
+message ResourceSpec {
+    int64 cpu_millis = 1;      // CPU in milli-cores (1000 = 1 CPU)
+    int64 memory_bytes = 2;    // Memory in bytes
+    int64 gpu_count = 3;       // Number of GPUs
+    map<string, string> extended = 4;  // Extended resources
+}
+
+// Placement constraints for task scheduling
+message PlacementConstraints {
+    repeated string required_labels = 1;    // Node must have these labels
+    repeated string preferred_labels = 2;   // Prefer nodes with these labels
+    repeated NodeID anti_affinity = 3;      // Avoid these nodes
+    string zone = 4;                        // Availability zone constraint
+}
+
+// ============== Task Lifecycle ==============
+
+enum TaskStatus {
+    TASK_STATUS_UNSPECIFIED = 0;
+    TASK_STATUS_PENDING = 1;        // Submitted, waiting for scheduling
+    TASK_STATUS_SCHEDULED = 2;      // Assigned to a node, not yet running
+    TASK_STATUS_RUNNING = 3;        // Currently executing
+    TASK_STATUS_SUCCEEDED = 4;      // Completed successfully
+    TASK_STATUS_FAILED = 5;         // Failed with error
+    TASK_STATUS_CANCELLED = 6;      // Cancelled by user
+    TASK_STATUS_TIMEOUT = 7;        // Exceeded TTL
+    TASK_STATUS_ORPHANED = 8;       // Worker died, needs rescheduling
+}
+
+// Task definition
+message Task {
+    TaskID id = 1;
+    string name = 2;
+    string namespace = 3;
+    
+    // Spec
+    string image = 10;                       // Container image or WASM module
+    repeated string args = 11;               // Command arguments
+    repeated string env = 12;                // Environment variables (KEY=VALUE)
+    ResourceSpec resources = 13;             // Resource requirements
+    PlacementConstraints constraints = 14;   // Placement constraints
+    uint64 ttl_log_entries = 15;             // TTL in log entries (deterministic time)
+    int32 max_retries = 16;                  // Max retry attempts
+    
+    // Status
+    TaskStatus status = 20;
+    NodeID assigned_node = 21;
+    uint64 created_at_index = 22;            // Log index when created (deterministic time)
+    uint64 scheduled_at_index = 23;          // Log index when scheduled
+    uint64 started_at_index = 24;            // Log index when started
+    uint64 finished_at_index = 25;           // Log index when finished
+    int32 exit_code = 26;
+    string error_message = 27;
+    int32 retry_count = 28;
+    
+    // Fencing token for zombie worker protection
+    uint64 fencing_token = 30;               // Monotonically increasing per task
+    uint64 lease_expiry_index = 31;          // Log index when lease expires
+    
+    // Metadata
+    map<string, string> labels = 40;
+    map<string, string> annotations = 41;
+    string submitted_by = 42;                // User/service that submitted
+}
+
+// ============== Fencing Tokens ==============
+
+// Fencing token for preventing zombie workers
+// A worker must present a valid fencing token to:
+// 1. Start executing a task
+// 2. Report task status
+// 3. Access task resources
+message FencingToken {
+    TaskID task_id = 1;
+    uint64 token = 2;           // Monotonically increasing
+    uint64 issued_at_index = 3; // Log index when token was issued
+    NodeID node_id = 4;         // Node this token is valid for
+}
+
+// ============== Log-Based Leases ==============
+
+// Lease for task execution, based on log index (deterministic)
+message TaskLease {
+    TaskID task_id = 1;
+    NodeID node_id = 2;             // Worker holding the lease
+    uint64 start_index = 3;         // Log index when lease started
+    uint64 expiry_index = 4;        // Log index when lease expires
+    uint64 fencing_token = 5;       // Current fencing token
+    bool valid = 6;                 // Whether lease is still valid
+}
+
+// ============== Commands (State Machine Inputs) ==============
+
+message Command {
+    oneof command {
+        SubmitTaskCommand submit_task = 1;
+        ScheduleTaskCommand schedule_task = 2;
+        StartTaskCommand start_task = 3;
+        CompleteTaskCommand complete_task = 4;
+        FailTaskCommand fail_task = 5;
+        CancelTaskCommand cancel_task = 6;
+        TimeoutTaskCommand timeout_task = 7;
+        OrphanTaskCommand orphan_task = 8;
+        RenewLeaseCommand renew_lease = 9;
+        RegisterNodeCommand register_node = 10;
+        UpdateNodeHeartbeatCommand update_heartbeat = 11;
+        DeregisterNodeCommand deregister_node = 12;
+    }
+}
+
+message SubmitTaskCommand {
+    string name = 1;
+    string namespace = 2;
+    string image = 3;
+    repeated string args = 4;
+    repeated string env = 5;
+    ResourceSpec resources = 6;
+    PlacementConstraints constraints = 7;
+    uint64 ttl_log_entries = 8;  // TTL in log entries
+    int32 max_retries = 9;
+    map<string, string> labels = 10;
+    string submitted_by = 11;
+}
+
+message ScheduleTaskCommand {
+    TaskID task_id = 1;
+    NodeID node_id = 2;
+    uint64 fencing_token = 3;     // New fencing token for this assignment
+    uint64 lease_duration = 4;    // Lease duration in log entries
+}
+
+message StartTaskCommand {
+    TaskID task_id = 1;
+    NodeID node_id = 2;
+    uint64 fencing_token = 3;     // Must match current token
+}
+
+message CompleteTaskCommand {
+    TaskID task_id = 1;
+    NodeID node_id = 2;
+    uint64 fencing_token = 3;     // Must match current token
+    int32 exit_code = 4;
+}
+
+message FailTaskCommand {
+    TaskID task_id = 1;
+    NodeID node_id = 2;
+    uint64 fencing_token = 3;     // Must match current token
+    string error_message = 4;
+    bool should_retry = 5;        // Whether to retry the task
+}
+
+message CancelTaskCommand {
+    TaskID task_id = 1;
+    string reason = 2;
+    uint64 fencing_token = 3;     // New token to invalidate any running workers
+}
+
+message TimeoutTaskCommand {
+    TaskID task_id = 1;
+    // No fencing token needed - triggered by deterministic time
+}
+
+message OrphanTaskCommand {
+    TaskID task_id = 1;
+    NodeID dead_node = 2;
+    // No fencing token needed - triggered by node failure detection
+}
+
+message RenewLeaseCommand {
+    TaskID task_id = 1;
+    NodeID node_id = 2;
+    uint64 fencing_token = 3;     // Must match current token
+    uint64 additional_entries = 4; // How many more log entries to extend
+}
+
+message RegisterNodeCommand {
+    NodeID node_id = 1;
+    string hostname = 2;
+    ResourceSpec capacity = 3;
+    map<string, string> labels = 4;
+    repeated string available_runtimes = 5;
+}
+
+message UpdateNodeHeartbeatCommand {
+    NodeID node_id = 1;
+    ResourceSpec available = 2;
+    repeated TaskID running_tasks = 3;
+    NodeHealth health = 4;
+    uint64 current_index = 5;     // Log index at heartbeat time
+}
+
+message DeregisterNodeCommand {
+    NodeID node_id = 1;
+    string reason = 2;
+}
+
+// ============== Node Health ==============
+
+enum NodeHealth {
+    NODE_HEALTH_UNSPECIFIED = 0;
+    NODE_HEALTH_HEALTHY = 1;
+    NODE_HEALTH_DEGRADED = 2;
+    NODE_HEALTH_UNHEALTHY = 3;
+}
+
+message Node {
+    NodeID id = 1;
+    string hostname = 2;
+    ResourceSpec capacity = 3;
+    ResourceSpec allocated = 4;
+    map<string, string> labels = 5;
+    NodeHealth health = 6;
+    uint64 last_heartbeat_index = 7;  // Log index of last heartbeat
+    repeated string available_runtimes = 8;
+    repeated TaskID running_tasks = 9;
+}
+
+// ============== Raft Messages ==============
+
+message AppendEntriesRequest {
+    uint64 term = 1;
+    uint64 leader_id = 2;
+    uint64 prev_log_index = 3;
+    uint64 prev_log_term = 4;
+    repeated LogEntry entries = 5;
+    uint64 leader_commit = 6;
+}
+
+message LogEntry {
+    uint64 term = 1;
+    uint64 index = 2;
+    Command command = 3;
+}
+
+message AppendEntriesResponse {
+    uint64 term = 1;
+    bool success = 2;
+    uint64 match_index = 3;
+    uint64 conflict_index = 4;
+}
+
+message RequestVoteRequest {
+    uint64 term = 1;
+    uint64 candidate_id = 2;
+    uint64 last_log_index = 3;
+    uint64 last_log_term = 4;
+}
+
+message RequestVoteResponse {
+    uint64 term = 1;
+    bool vote_granted = 2;
+}
+
+message InstallSnapshotRequest {
+    uint64 term = 1;
+    uint64 leader_id = 2;
+    uint64 last_included_index = 3;
+    uint64 last_included_term = 4;
+    bytes snapshot_data = 5;
+    uint64 offset = 6;
+    bool done = 7;
+}
+
+message InstallSnapshotResponse {
+    uint64 term = 1;
+    uint64 last_included_index = 2;
+}
+
+// ============== Snapshot ==============
+
+message Snapshot {
+    uint64 last_included_index = 1;
+    uint64 last_included_term = 2;
+    
+    // State machine snapshot
+    ProcessTableSnapshot process_table = 10;
+    ClusterStateSnapshot cluster_state = 11;
+}
+
+message ProcessTableSnapshot {
+    repeated Task tasks = 1;
+    uint64 next_task_sequence = 2;
+    uint64 next_fencing_token = 3;  // Global fencing token counter
+}
+
+message ClusterStateSnapshot {
+    repeated Node nodes = 1;
+    map<string, string> config = 2;
+    uint64 current_log_index = 3;   // Deterministic "time"
+}
+
+// ============== Worker Messages ==============
+
+message TaskAssignment {
+    Task task = 1;
+    uint64 fencing_token = 2;
+    uint64 lease_expiry_index = 3;
+}
+
+message TaskStatusReport {
+    TaskID task_id = 1;
+    uint64 fencing_token = 2;
+    TaskStatus status = 3;
+    int32 exit_code = 4;
+    string error_message = 5;
+    bytes stdout_chunk = 6;
+    bytes stderr_chunk = 7;
+}
+
+message TaskStatusReportResponse {
+    bool accepted = 1;
+    string rejection_reason = 2;  // e.g., "invalid fencing token"
+    uint64 current_fencing_token = 3;
+}
