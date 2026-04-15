@@ -1,10 +1,10 @@
 """AetherGrid CLI (Typer-based).
 
 Commands:
-  aether submit
-  aether status / logs / cancel
-  aether cluster start / stop
-  aether workflow run
+  aether submit --name myjob --image python3 --args "script.py,arg1"
+  aether status 0:1
+  aether logs 0:1
+  aether cluster start / stop / status
 """
 
 import asyncio
@@ -38,9 +38,9 @@ def main():
         sys.exit(1)
     
     # Build Typer app here (after confirming typer exists)
-    app = typer.Typer(name="aether", help="AetherGrid CLI - Decentralized Task Orchestration")
+    app = typer.Typer(name="aether", help="AetherGrid CLI - Distributed Task Orchestration via gRPC")
     
-    cluster_app = typer.Typer(help="Local dev cluster management")
+    cluster_app = typer.Typer(help="Cluster management")
     app.add_typer(cluster_app, name="cluster")
     
     workflow_app = typer.Typer(help="DAG workflow commands")
@@ -50,18 +50,28 @@ def main():
     @app.command()
     def submit(
         name: str = typer.Option("unnamed", "--name", "-n", help="Task name"),
-        image: str = typer.Option("alpine", "--image", "-i"),
-        args: str = typer.Option("", "--args", help="Comma-separated args"),
-        namespace: str = typer.Option("default", "--namespace"),
+        image: str = typer.Option("python3", "--image", "-i", help="Executable (python3, /path/to/script)"),
+        args: str = typer.Option("", "--args", "-a", help="Comma-separated args"),
     ):
-        """Submit a task."""
-        task = _cluster.submit_task(name=name, image=image)
-        typer.echo(f"Submitted task {task['id']} (fencing_token={task['fencing_token']})")
+        """Submit a task via gRPC."""
+        try:
+            # Parse comma-separated args into list
+            args_list = [a.strip() for a in args.split(",")] if args else []
+            task = _cluster.submit_task(name=name, image=image, args=args_list)
+            typer.echo(f"Submitted task {task['id']}")
+            typer.echo(f"  Name: {name}")
+            typer.echo(f"  Image: {image}")
+            typer.echo(f"  Args: {args}")
+            typer.echo(f"\nCheck status: aether status {task['id']}")
+        except Exception as e:
+            typer.echo(f"Error: {e}", err=True)
+            typer.echo("Is the cluster running? Use 'aether cluster start'", err=True)
+            raise typer.Exit(1)
 
     # --- Status ---
     @app.command()
-    def status(task_id: str = typer.Argument(..., help="Task ID e.g. 0:5")):
-        """Get task status."""
+    def status(task_id: str = typer.Argument(..., help="Task ID e.g. 0:1")):
+        """Get task status via gRPC."""
         task = _cluster.get_task(task_id)
         if task:
             typer.echo(json.dumps(task, indent=2))
@@ -71,18 +81,22 @@ def main():
 
     # --- Logs ---
     @app.command()
-    def logs(task_id: str = typer.Argument(...), follow: bool = False):
-        """Stream task logs (simulated)."""
+    def logs(task_id: str = typer.Argument(..., help="Task ID e.g. 0:1")):
+        """Show task logs via gRPC."""
         task = _cluster.get_task(task_id)
-        if task:
-            typer.echo(f"[sim] Logs for task {task_id} (status={task.get('status')}):")
-            typer.echo("  hello from aethergrid task\n  task completed successfully")
-        else:
+        if not task:
             typer.echo("Task not found", err=True)
+            raise typer.Exit(1)
+        
+        task_logs = _cluster.get_logs(task_id)
+        typer.echo(f"Logs for task {task_id} (status={task.get('status')}):")
+        typer.echo("-" * 40)
+        for entry in task_logs:
+            typer.echo(entry.get("line", ""))
 
     # --- Cancel ---
     @app.command()
-    def cancel(task_id: str = typer.Argument(...)):
+    def cancel(task_id: str = typer.Argument(..., help="Task ID e.g. 0:1")):
         """Cancel a running/pending task."""
         task = _cluster.update_task(task_id, {"status": "cancelled"})
         if task:
@@ -92,20 +106,23 @@ def main():
 
     # --- Cluster ---
     @cluster_app.command("start")
-    def cluster_start(background: bool = typer.Option(True, "--background/--no-background")):
-        """Start local 3-node dev cluster."""
+    def cluster_start(
+        port: int = typer.Option(50051, "--port", "-p", help="gRPC port"),
+        background: bool = typer.Option(True, "--background/--no-background"),
+    ):
+        """Start gRPC cluster (leader + worker)."""
         cluster = DevCluster()
-        cluster.start(background=background)
+        cluster.start(port=port, background=background)
 
     @cluster_app.command("stop")
     def cluster_stop():
-        """Stop local dev cluster."""
+        """Stop gRPC cluster."""
         cluster = DevCluster()
         cluster.stop()
 
     @cluster_app.command("status")
     def cluster_status():
-        """Show cluster status (3 nodes)."""
+        """Show cluster status."""
         status = _cluster.cluster_status()
         if not status["running"]:
             typer.echo("Cluster not running. Use 'aether cluster start'.")
@@ -122,10 +139,11 @@ def main():
                 file.write_text("""name: sample
 tasks:
   - name: step1
-    image: alpine
-    args: [echo, hello]
+    image: python3
+    args: ["-c", "print('hello')"]
   - name: step2
-    image: alpine
+    image: python3
+    args: ["-c", "print('world')"]
     depends_on: [step1]
 """)
             typer.echo("Template created. Re-run the command.")
@@ -147,14 +165,6 @@ tasks:
         """Run quick benchmark."""
         res = asyncio.run(benchmark_task_submission(n))
         typer.echo(json.dumps(res, indent=2))
-
-    # --- Chaos ---
-    @app.command()
-    def chaos():
-        """Run chaos tests (demo)."""
-        from aethergrid.testing import ChaosMonkey
-        typer.echo("Chaos suite ready (see aethergrid/testing/chaos.py)")
-        typer.echo("Example: ChaosMonkey can kill nodes, partition network.")
 
     # Run the app
     app()

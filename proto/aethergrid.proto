@@ -339,3 +339,97 @@ message TaskStatusReportResponse {
     string rejection_reason = 2;  // e.g., "invalid fencing token"
     uint64 current_fencing_token = 3;
 }
+
+// ============== Client API Messages ==============
+
+message SubmitTaskRequest {
+    string name = 1;
+    string namespace = 2;
+    string image = 3;
+    repeated string args = 4;
+    repeated string env = 5;
+    ResourceSpec resources = 6;
+    map<string, string> labels = 7;
+}
+
+message SubmitTaskResponse {
+    bool success = 1;
+    string error = 2;
+    Task task = 3;
+}
+
+message GetTaskRequest {
+    string task_id = 1;  // Format: "shard:sequence"
+}
+
+message GetTaskResponse {
+    bool found = 1;
+    Task task = 2;
+}
+
+message ListTasksRequest {
+    string namespace = 1;
+    string status_filter = 2;
+    int32 limit = 3;
+}
+
+message ListTasksResponse {
+    repeated Task tasks = 1;
+}
+
+message GetLogsRequest {
+    string task_id = 1;
+}
+
+message GetLogsResponse {
+    repeated string lines = 1;
+    string status = 2;
+}
+
+// ============== gRPC Services ==============
+
+// RaftService - Internal Raft consensus protocol
+service RaftService {
+    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+    rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+    rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+// TaskService - Client API for task submission and queries
+service TaskService {
+    rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+    rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+    rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+    rpc GetLogs(GetLogsRequest) returns (GetLogsResponse);
+    rpc CancelTask(GetTaskRequest) returns (GetTaskResponse);
+}
+
+// WorkerService - Worker-to-leader communication
+service WorkerService {
+    rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+    rpc ReportStatus(TaskStatusReport) returns (TaskStatusReportResponse);
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message RegisterNodeRequest {
+    string node_id = 1;
+    string hostname = 2;
+    ResourceSpec capacity = 3;
+    map<string, string> labels = 4;
+    repeated string runtimes = 5;
+}
+
+message RegisterNodeResponse {
+    bool accepted = 1;
+    string leader_id = 2;
+}
+
+message HeartbeatRequest {
+    string node_id = 1;
+    repeated string running_tasks = 2;
+    ResourceSpec available = 3;
+}
+
+message HeartbeatResponse {
+    bool acknowledged = 1;
+}

@@ -619,6 +619,9 @@ class RaftNode:
         3. Only applied after commit_index advances
         4. Future is resolved when the command is applied
         
+        For single-node clusters (no peers), the command is immediately
+        committed and applied.
+        
         Returns (success, result_or_error) when the command is committed.
         """
         if self.state != RaftState.LEADER:
@@ -638,6 +641,19 @@ class RaftNode:
         self._log_cache[entry.index] = entry
         await self.storage.append_log_entry(entry)
         
+        # Single-node cluster: immediately commit and apply
+        if not self.peers:
+            self.commit_index = log_index
+            # Apply the command to get the result
+            command_decoded = self._decode_command(entry.command)
+            command_type = command_decoded.get("type", "")
+            self.state_machine.set_log_index(log_index)
+            result = self.state_machine.apply_command(command_type, command_decoded)
+            self.state_machine.advance_log_index()
+            self.last_applied = log_index
+            return True, result
+        
+        # Multi-node cluster: wait for replication
         # Create pending command (to be resolved when committed)
         pending = PendingCommand(log_index, command, loop)
         self._pending_commands[log_index] = pending
