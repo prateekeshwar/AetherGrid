@@ -523,6 +523,11 @@ class ProcessTableState:
                 error=f"Task is not pending (status={task.status.value})"
             )
         
+        # Resource quota check (simple: max 100 tasks per node)
+        current_on_node = len(self.tasks_by_node.get(node_id.id, []))
+        if current_on_node >= 100:
+            return CommandResult(success=False, error="Node quota exceeded (max 100 tasks)")
+        
         # Generate new fencing token for this assignment
         # This invalidates any previous tokens (zombie worker protection)
         new_fencing_token = self.generate_fencing_token()

@@ -66,6 +66,25 @@ from .worker import (
     FencingTokenValidator,
 )
 
+from .workflow import (
+    WorkflowEngine,
+    Workflow,
+    WorkflowTask,
+    define_workflow,
+    run_workflow,
+)
+
+from .config import (
+    ConfigLoader,
+    load_config,
+    get_secret,
+)
+
+from .testing import (
+    benchmark_task_submission,
+    ChaosMonkey,
+)
+
 __all__ = [
     # Version
     "__version__",
@@ -96,4 +115,20 @@ __all__ = [
     "WorkerAgent",
     "TaskHandle",
     "FencingTokenValidator",
+    
+    # Workflow
+    "WorkflowEngine",
+    "Workflow",
+    "WorkflowTask",
+    "define_workflow",
+    "run_workflow",
+    
+    # Config
+    "ConfigLoader",
+    "load_config",
+    "get_secret",
+    
+    # Testing
+    "benchmark_task_submission",
+    "ChaosMonkey",
 ]

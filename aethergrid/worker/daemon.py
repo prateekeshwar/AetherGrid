@@ -494,10 +494,12 @@ class WorkerDaemon:
         """Main event loop for the worker daemon."""
         self._running = True
         
+        # Graceful shutdown on signals
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, lambda: self.stop())
+        
         # Connect to cluster
-        while not await self.connect():
-            print("Retrying connection in 5 seconds...")
-            await asyncio.sleep(5.0)
         
         self.state = WorkerState.RUNNING
         
