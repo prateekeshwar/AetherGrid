@@ -131,7 +131,7 @@ class GrpcCluster:
             _append_log(f"{task.id.shard}:{task.id.sequence}", f"[ERROR] Failed to schedule: {schedule_result.error}")
             return
         
-        # Create assignment for worker
+        # Create assignment for worker with resources
         assignment = {
             "task_id": f"{task.id.shard}:{task.id.sequence}",
             "fencing_token": schedule_result.fencing_token,
@@ -139,6 +139,7 @@ class GrpcCluster:
             "image": task.image,
             "args": task.args,
             "env": task.env or [],
+            "resources": task.resources.to_dict() if hasattr(task.resources, 'to_dict') else {},
         }
         
         # Execute via worker
@@ -225,7 +226,7 @@ class GrpcCluster:
         self.raft_node.state = RaftState.LEADER
         self.raft_node._running = True
         
-        # Create worker
+        # Create worker with GPU support
         self.worker = WorkerAgent(
             node_id="worker-1",
             hostname="localhost",
@@ -233,7 +234,22 @@ class GrpcCluster:
             send_to_leader=self._send_to_leader,
             labels={"runtime": "process"},
             runtime="process",
+            gpu_count=0,  # Set to actual GPU count if available
+            gpu_memory_mb=0,  # Set to actual GPU memory if available
         )
+        
+        # Register worker in state machine
+        self.raft_node.state_machine.apply_command("register_node", {
+            "node_id": {"id": "worker-1"},
+            "hostname": "localhost",
+            "capacity": {
+                "cpu_millis": 4000,
+                "memory_bytes": 8 * 1024 * 1024 * 1024,
+                "gpu_count": 0,
+                "gpu_memory_mb": 0,
+            },
+            "labels": {"runtime": "process"},
+        })
         
         # Create gRPC server
         self.grpc_server = create_grpc_server(
@@ -247,8 +263,30 @@ class GrpcCluster:
         # Start everything
         await self.grpc_server.start()
         
-        # Start worker run loop
-        worker_task = asyncio.create_task(self.worker.run())
+        # Wait for gRPC server to be ready
+        await asyncio.sleep(0.3)
+        
+        # Verify server is listening by testing a connection
+        import grpc
+        test_channel = grpc.aio.insecure_channel(f"127.0.0.1:{self.port}")
+        try:
+            await asyncio.wait_for(test_channel.channel_ready(), timeout=2.0)
+            print(f"[cluster] gRPC server verified listening on 127.0.0.1:{self.port}")
+        except asyncio.TimeoutError:
+            print(f"[cluster] WARNING: gRPC server may not be ready")
+        finally:
+            await test_channel.close()
+        
+        # Start worker run loop with error handling
+        async def run_worker_with_error_handling():
+            try:
+                await self.worker.run()
+            except Exception as e:
+                print(f"[cluster] Worker error: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        worker_task = asyncio.create_task(run_worker_with_error_handling())
         self._tasks.append(worker_task)
         
         # Save port for CLI
@@ -278,9 +316,19 @@ class GrpcCluster:
         """Run until interrupted."""
         try:
             while self._running:
+                # Check if worker task is still alive
+                for task in self._tasks:
+                    if task.done():
+                        exc = task.exception()
+                        if exc:
+                            print(f"[cluster] Task failed: {exc}")
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
             pass
+        except Exception as e:
+            print(f"[cluster] run_forever error: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             await self.stop()
 
@@ -289,10 +337,24 @@ def _run_cluster_in_process(port: int = 50051):
     """Run the cluster in a dedicated process."""
     async def _main():
         cluster = GrpcCluster(port=port)
-        await cluster.start()
-        await cluster.run_forever()
+        try:
+            await cluster.start()
+            await cluster.run_forever()
+        except Exception as e:
+            print(f"[cluster] Error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            await cluster.stop()
     
-    asyncio.run(_main())
+    try:
+        asyncio.run(_main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"[cluster] Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 class DevCluster:
@@ -329,12 +391,46 @@ class DevCluster:
         print(f"Starting AetherGrid cluster on port {port}...")
         
         if background:
-            p = Process(target=_run_cluster_in_process, args=(port,), daemon=True)
-            p.start()
+            # Use subprocess to start the cluster in background
+            import subprocess
+            import sys
+            from pathlib import Path
+            
+            script_path = Path(__file__).parent.parent / "scripts" / "dev_cluster.py"
+            
+            # Start the process in background using nohup-like behavior
+            p = subprocess.Popen(
+                [sys.executable, str(script_path), "--port", str(port)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,  # Detach from parent process
+            )
             self._write_pid(p.pid)
-            time.sleep(0.5)
-            print(f"Cluster started (pid={p.pid}, port={port})")
-            print("Commands: aether submit | aether status | aether logs")
+            
+            # Wait for server to be ready
+            import grpc
+            import time
+            max_wait = 5.0
+            start_time = time.time()
+            ready = False
+            
+            while time.time() - start_time < max_wait:
+                try:
+                    # Try to connect
+                    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+                    grpc.channel_ready_future(channel).result(timeout=0.5)
+                    ready = True
+                    channel.close()
+                    break
+                except Exception:
+                    time.sleep(0.2)
+            
+            if ready:
+                print(f"Cluster started (pid={p.pid}, port={port})")
+                print("Commands: aether submit | aether status | aether logs")
+            else:
+                print(f"WARNING: Cluster process started but gRPC not responding on port {port}")
+                print(f"Check logs or try 'aether cluster stop' and restart")
         else:
             print("Running in foreground (Ctrl+C to stop)")
             _run_cluster_in_process(port)
@@ -360,18 +456,20 @@ class DevCluster:
             PORT_FILE.unlink()
         print("Cluster stopped.")
     
-    def submit_task(self, name="unnamed", image="python3", args=None, **kwargs):
-        """Submit a task via gRPC."""
+    def submit_task(self, name="unnamed", image="python3", args=None, env=None, resources=None, namespace="default", **kwargs):
+        """Submit a task via gRPC with resource requirements."""
         port = self._read_port()
         
         # Run async submission
         async def _submit():
-            client = create_task_client(f"localhost:{port}")
+            client = create_task_client(f"127.0.0.1:{port}")
             result = await submit_task_via_grpc(
                 client=client,
                 name=name,
                 image=image,
                 args=args or [],
+                env=env or [],
+                namespace=namespace,
             )
             return result
         
@@ -386,11 +484,16 @@ class DevCluster:
                 "name": name,
                 "image": image,
                 "args": args or [],
+                "env": env or [],
+                "resources": resources or {},
+                "namespace": namespace,
                 "status": "pending",
                 "created": time.time(),
             }
             _save_tasks(tasks)
             _append_log(task_id, f"[SUBMIT] Task submitted: {name}")
+            if resources:
+                _append_log(task_id, f"[RESOURCES] GPU={resources.get('gpu_count', 0)}, CPU={resources.get('cpu_millis', 0)}m, Memory={resources.get('memory_bytes', 0) // (1024*1024)}MB")
             return tasks[task_id]
         else:
             raise Exception(result.get("error", "Failed to submit task"))
@@ -400,7 +503,7 @@ class DevCluster:
         port = self._read_port()
         
         async def _get():
-            client = create_task_client(f"localhost:{port}")
+            client = create_task_client(f"127.0.0.1:{port}")
             return await get_task_via_grpc(client, task_id)
         
         result = asyncio.run(_get())
@@ -427,7 +530,7 @@ class DevCluster:
         port = self._read_port()
         
         async def _get():
-            client = create_task_client(f"localhost:{port}")
+            client = create_task_client(f"127.0.0.1:{port}")
             return await get_logs_via_grpc(client, task_id)
         
         result = asyncio.run(_get())
@@ -454,6 +557,70 @@ class DevCluster:
             "leader": 1,
             "task_count": len(_load_tasks()),
         }
+    
+    def get_cluster_resources(self):
+        """Get cluster resource summary."""
+        # For now, return mock data since we don't have direct access to state machine
+        # In production, this would query the actual cluster
+        pid = self._read_pid()
+        if not pid:
+            return None
+        
+        return {
+            "capacity": {
+                "cpu_millis": 4000,
+                "memory_bytes": 8 * 1024 * 1024 * 1024,
+                "gpu_count": 0,
+                "gpu_memory_mb": 0,
+            },
+            "available": {
+                "cpu_millis": 4000,
+                "memory_bytes": 8 * 1024 * 1024 * 1024,
+                "gpu_count": 0,
+                "gpu_memory_mb": 0,
+            },
+            "allocated": {
+                "cpu_millis": 0,
+                "memory_bytes": 0,
+                "gpu_count": 0,
+                "gpu_memory_mb": 0,
+            },
+            "node_count": 1,
+            "gpu_nodes": 0,
+        }
+    
+    def get_cluster_nodes(self):
+        """Get detailed node information for the cluster dashboard."""
+        pid = self._read_pid()
+        if not pid:
+            return None
+        
+        # For now, return the embedded worker node info
+        # In a multi-node cluster, this would query all registered nodes
+        tasks = _load_tasks()
+        running_task_count = sum(1 for t in tasks.values() if t.get("status") == "running")
+        
+        return [
+            {
+                "id": "worker-1",
+                "hostname": "localhost",
+                "health": "healthy",
+                "capacity": {
+                    "cpu_millis": 4000,
+                    "memory_bytes": 8 * 1024 * 1024 * 1024,
+                    "gpu_count": 0,
+                    "gpu_memory_mb": 0,
+                },
+                "available": {
+                    "cpu_millis": 4000,
+                    "memory_bytes": 8 * 1024 * 1024 * 1024,
+                    "gpu_count": 0,
+                    "gpu_memory_mb": 0,
+                },
+                "running_task_count": running_task_count,
+                "labels": {"runtime": "process"},
+            }
+        ]
 
 
 if __name__ == "__main__":

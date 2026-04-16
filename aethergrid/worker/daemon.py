@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""AetherGrid v2.0 - Worker Daemon with gRPC Streaming.
+"""AetherGrid v2.0 - Standalone Worker Daemon.
 
-The worker daemon:
-1. Connects to the cluster via gRPC
-2. Streams task assignments in real-time
-3. Executes tasks with subprocess isolation
-4. Tracks lease expiry and kills tasks on connection loss
-5. Reports status with fencing tokens
+A standalone worker that joins an AetherGrid cluster via gRPC.
 
-Worker Safety:
-- Tracks lease_expiry_index from leader
-- Kills subprocess if cluster connection lost
-- Validates fencing tokens before status reports
+Features:
+1. Joins cluster via RegisterNode gRPC call
+2. Receives task assignments from leader
+3. Executes Docker containers with GPU passthrough
+4. Reports status with fencing tokens
+5. Monitors lease expiry and kills tasks when expired
+6. Tracks GPU/VRAM resources
+
+Usage:
+    # Start a worker with 2 GPUs
+    aether worker start --node-id worker-1 --gpu-count 2 --gpu-memory 16384
+    
+    # Start a CPU-only worker
+    aether worker start --node-id worker-2
 """
 
 import asyncio
@@ -20,12 +25,13 @@ import os
 import signal
 import json
 import time
+import socket
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Callable
+from typing import Any, Dict, List, Optional
 from enum import Enum
-import socket
-import struct
+
+import grpc
 
 
 class WorkerState(Enum):
@@ -43,165 +49,255 @@ class RunningTask:
     task_id: str
     fencing_token: int
     lease_expiry_index: int
-    process: asyncio.subprocess.Process
-    started_at: float
-    log_index_at_start: int
-    
-    # stdout/stderr buffers
-    stdout_buffer: List[bytes] = field(default_factory=list)
-    stderr_buffer: List[bytes] = field(default_factory=list)
+    process: Optional[asyncio.subprocess.Process] = None
+    container_id: Optional[str] = None
+    started_at: float = 0.0
+    resources: Dict[str, int] = field(default_factory=dict)
 
 
 class WorkerDaemon:
     """
-    Worker daemon with gRPC streaming and safety features.
+    Standalone worker daemon with gRPC connectivity.
     
     Key features:
-    1. Real-time task assignment via gRPC streaming
-    2. Lease tracking - kills tasks when lease expires
-    3. Connection monitoring - kills tasks on disconnect
-    4. Fencing token validation
+    1. Registers with cluster via gRPC
+    2. Executes Docker containers with GPU support
+    3. Tracks lease expiry and kills tasks
+    4. Reports status with fencing tokens
     """
     
-    # Safety parameters
-    HEARTBEAT_INTERVAL = 5.0        # Seconds between heartbeats
-    CONNECTION_TIMEOUT = 15.0       # Seconds before considering disconnected
-    LEASE_RENEWAL_MARGIN = 200      # Renew lease when this many entries remain
+    HEARTBEAT_INTERVAL = 5.0
+    CONNECTION_TIMEOUT = 15.0
     
     def __init__(
         self,
         node_id: str,
         cluster_address: str,
         hostname: Optional[str] = None,
-        capacity: Optional[Dict[str, int]] = None,
+        cpu_millis: int = 4000,
+        memory_mb: int = 8192,
+        gpu_count: int = 0,
+        gpu_memory_mb: int = 0,
         labels: Optional[Dict[str, str]] = None,
         runtime: str = "docker",
-        data_dir: str = "/tmp/aethergrid/worker",
     ):
         self.node_id = node_id
         self.cluster_address = cluster_address
         self.hostname = hostname or socket.gethostname()
-        self.capacity = capacity or {"cpu_millis": 4000, "memory_bytes": 8589934592}
+        self.cpu_millis = cpu_millis
+        self.memory_mb = memory_mb
+        self.gpu_count = gpu_count
+        self.gpu_memory_mb = gpu_memory_mb
         self.labels = labels or {}
         self.runtime = runtime
-        self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
         
         # State
         self.state = WorkerState.INITIALIZING
         self.running_tasks: Dict[str, RunningTask] = {}
         
-        # Lease tracking
-        self.cluster_log_index: int = 0      # Last known cluster log index
-        self.last_heartbeat_time: float = 0  # Time of last successful heartbeat
-        self.last_connection_time: float = 0 # Time of last successful connection
+        # Resource tracking
+        self.allocated_cpu = 0
+        self.allocated_memory_mb = 0
+        self.allocated_gpu_count = 0
+        self.allocated_gpu_memory_mb = 0
         
-        # gRPC connection
-        self._channel = None
+        # Lease tracking
+        self.cluster_log_index: int = 0
+        self.last_heartbeat_time: float = 0
+        
+        # gRPC
+        self._channel: Optional[grpc.aio.Channel] = None
+        self._worker_stub = None
         self._connected = False
         
-        # Running flag
+        # Running
         self._running = False
         self._tasks: List[asyncio.Task] = []
         
-        # Assignment stream
-        self._assignment_queue: asyncio.Queue = asyncio.Queue()
+        # Docker availability
+        self._docker_available: Optional[bool] = None
     
-    # ========== Connection Management ==========
+    def _check_docker_available(self) -> bool:
+        """Check if Docker is available."""
+        if self._docker_available is not None:
+            return self._docker_available
+        
+        try:
+            result = subprocess.run(
+                ["docker", "version"],
+                capture_output=True,
+                timeout=5
+            )
+            self._docker_available = result.returncode == 0
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            self._docker_available = False
+        
+        return self._docker_available
+    
+    # ========== Resource Tracking ==========
+    
+    def get_available_resources(self) -> Dict[str, int]:
+        """Get currently available resources."""
+        return {
+            "cpu_millis": self.cpu_millis - self.allocated_cpu,
+            "memory_bytes": (self.memory_mb - self.allocated_memory_mb) * 1024 * 1024,
+            "gpu_count": self.gpu_count - self.allocated_gpu_count,
+            "gpu_memory_mb": self.gpu_memory_mb - self.allocated_gpu_memory_mb,
+        }
+    
+    def can_allocate(self, resources: Dict[str, int]) -> bool:
+        """Check if we can allocate the requested resources."""
+        avail = self.get_available_resources()
+        return (
+            avail["cpu_millis"] >= resources.get("cpu_millis", 0) and
+            avail["memory_bytes"] >= resources.get("memory_bytes", 0) and
+            avail["gpu_count"] >= resources.get("gpu_count", 0) and
+            avail["gpu_memory_mb"] >= resources.get("gpu_memory_mb", 0)
+        )
+    
+    def allocate(self, resources: Dict[str, int]) -> bool:
+        """Allocate resources for a task."""
+        if not self.can_allocate(resources):
+            return False
+        
+        self.allocated_cpu += resources.get("cpu_millis", 0)
+        self.allocated_memory_mb += resources.get("memory_bytes", 0) // (1024 * 1024)
+        self.allocated_gpu_count += resources.get("gpu_count", 0)
+        self.allocated_gpu_memory_mb += resources.get("gpu_memory_mb", 0)
+        return True
+    
+    def release(self, resources: Dict[str, int]) -> None:
+        """Release resources when a task completes."""
+        self.allocated_cpu = max(0, self.allocated_cpu - resources.get("cpu_millis", 0))
+        self.allocated_memory_mb = max(0, self.allocated_memory_mb - resources.get("memory_bytes", 0) // (1024 * 1024))
+        self.allocated_gpu_count = max(0, self.allocated_gpu_count - resources.get("gpu_count", 0))
+        self.allocated_gpu_memory_mb = max(0, self.allocated_gpu_memory_mb - resources.get("gpu_memory_mb", 0))
+    
+    # ========== gRPC Connection ==========
     
     async def connect(self) -> bool:
-        """Connect to the cluster."""
+        """Connect to the cluster via gRPC."""
+        max_retries = 3
+        retry_delay = 1.0
+        
+        for attempt in range(max_retries):
+            try:
+                from ..generated import aethergrid_pb2, aethergrid_pb2_grpc
+                
+                # Use 127.0.0.1 instead of localhost for faster resolution
+                address = self.cluster_address.replace("localhost", "127.0.0.1")
+                
+                self._channel = grpc.aio.insecure_channel(address)
+                self._worker_stub = aethergrid_pb2_grpc.WorkerServiceStub(self._channel)
+                
+                # Test connection with timeout
+                await asyncio.wait_for(self._channel.channel_ready(), timeout=5.0)
+                self._connected = True
+                self.last_heartbeat_time = asyncio.get_event_loop().time()
+                
+                print(f"[Worker] Connected to cluster at {address}")
+                return True
+                
+            except Exception as e:
+                print(f"[Worker] Connection attempt {attempt + 1}/{max_retries} failed: {e}")
+                if self._channel:
+                    await self._channel.close()
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+        
+        self._connected = False
+        return False
+    
+    async def register(self) -> bool:
+        """Register this worker with the cluster."""
+        if not self._connected:
+            return False
+        
         try:
-            # Simulate gRPC connection (in production, use actual gRPC)
-            self._connected = True
-            self.last_connection_time = asyncio.get_event_loop().time()
-            self.state = WorkerState.REGISTERED
+            from ..generated import aethergrid_pb2
             
-            # Register with cluster
-            await self._register()
+            request = aethergrid_pb2.RegisterNodeRequest(
+                node_id=self.node_id,
+                hostname=self.hostname,
+                capacity=aethergrid_pb2.ResourceSpec(
+                    cpu_millis=self.cpu_millis,
+                    memory_bytes=self.memory_mb * 1024 * 1024,
+                    gpu_count=self.gpu_count,
+                    gpu_memory_mb=self.gpu_memory_mb,
+                ),
+                labels=self.labels,
+                runtimes=[self.runtime],
+            )
             
-            return True
+            response = await self._worker_stub.RegisterNode(request)
+            
+            if response.accepted:
+                self.state = WorkerState.REGISTERED
+                print(f"[Worker] Registered with cluster. Leader: {response.leader_id}")
+                return True
+            else:
+                print(f"[Worker] Registration rejected")
+                return False
+                
         except Exception as e:
-            print(f"Failed to connect: {e}")
-            self._connected = False
+            print(f"[Worker] Registration failed: {e}")
             return False
     
     async def disconnect(self) -> None:
-        """Disconnect from cluster and kill all running tasks."""
+        """Disconnect from cluster."""
         self._connected = False
         self.state = WorkerState.DISCONNECTED
         
-        # CRITICAL: Kill all running tasks on disconnect
+        # Kill all running tasks
         await self._kill_all_tasks("Cluster connection lost")
-    
-    async def _register(self) -> bool:
-        """Register this worker with the cluster."""
-        # In production, this would be a gRPC call
-        registration = {
-            "node_id": self.node_id,
-            "hostname": self.hostname,
-            "capacity": self.capacity,
-            "labels": self.labels,
-            "runtimes": [self.runtime],
-        }
         
-        # Simulate successful registration
-        self.state = WorkerState.REGISTERED
-        return True
+        if self._channel:
+            await self._channel.close()
     
-    # ========== Task Assignment Streaming ==========
+    # ========== Heartbeat ==========
     
-    async def _stream_assignments(self) -> None:
-        """
-        Stream task assignments from the cluster.
-        
-        This is the main loop for receiving work.
-        Assignments include:
-        - Task definition
-        - Fencing token
-        - Lease expiry index
-        """
-        while self._running and self._connected:
+    async def _heartbeat_loop(self) -> None:
+        """Send periodic heartbeats."""
+        while self._running:
             try:
-                # In production, this would be a gRPC streaming call
-                # For now, we'll use a queue that can be populated externally
-                assignment = await asyncio.wait_for(
-                    self._assignment_queue.get(),
-                    timeout=1.0
-                )
-                
-                await self._handle_assignment(assignment)
-                
-            except asyncio.TimeoutError:
-                continue
+                await self._send_heartbeat()
+                await asyncio.sleep(self.HEARTBEAT_INTERVAL)
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                print(f"Error in assignment stream: {e}")
+                print(f"[Worker] Heartbeat failed: {e}")
                 await asyncio.sleep(1.0)
     
-    async def _handle_assignment(self, assignment: dict) -> None:
-        """Handle a task assignment from the cluster."""
-        task_id = assignment.get("task_id", "")
-        fencing_token = assignment.get("fencing_token", 0)
-        lease_expiry_index = assignment.get("lease_expiry_index", 0)
+    async def _send_heartbeat(self) -> None:
+        """Send heartbeat to leader."""
+        if not self._connected or not self._worker_stub:
+            return
         
-        print(f"Received assignment: task={task_id}, token={fencing_token}, lease={lease_expiry_index}")
-        
-        # Check if we already have this task
-        if task_id in self.running_tasks:
-            existing = self.running_tasks[task_id]
+        try:
+            from ..generated import aethergrid_pb2
             
-            # Check fencing token
-            if fencing_token < existing.fencing_token:
-                # Stale assignment - ignore
-                print(f"Ignoring stale assignment for {task_id}")
-                return
+            avail = self.get_available_resources()
             
-            if fencing_token > existing.fencing_token:
-                # New assignment - kill existing task
-                await self._kill_task(task_id, "Reassigned with new fencing token")
-        
-        # Execute the task
-        asyncio.create_task(self._execute_task(assignment))
+            request = aethergrid_pb2.HeartbeatRequest(
+                node_id=self.node_id,
+                running_tasks=[t.task_id for t in self.running_tasks.values()],
+                available=aethergrid_pb2.ResourceSpec(
+                    cpu_millis=avail["cpu_millis"],
+                    memory_bytes=avail["memory_bytes"],
+                    gpu_count=avail["gpu_count"],
+                    gpu_memory_mb=avail["gpu_memory_mb"],
+                ),
+            )
+            
+            response = await self._worker_stub.Heartbeat(request)
+            self.last_heartbeat_time = asyncio.get_event_loop().time()
+            
+            if response.acknowledged:
+                print(f"[Worker] Heartbeat acknowledged")
+                
+        except Exception as e:
+            print(f"[Worker] Heartbeat error: {e}")
     
     # ========== Task Execution ==========
     
@@ -213,33 +309,67 @@ class WorkerDaemon:
         image = assignment.get("image", "")
         args = assignment.get("args", [])
         env = assignment.get("env", [])
+        resources = assignment.get("resources", {})
         
-        print(f"Executing task {task_id}")
+        print(f"[Worker] Executing task {task_id}")
         
-        try:
-            # Start the process
-            process = await self._start_process(image, args, env)
-            
-            # Create running task record
-            running_task = RunningTask(
+        # Check resource availability
+        if not self.can_allocate(resources):
+            await self._report_status(
                 task_id=task_id,
                 fencing_token=fencing_token,
-                lease_expiry_index=lease_expiry_index,
-                process=process,
-                started_at=asyncio.get_event_loop().time(),
-                log_index_at_start=self.cluster_log_index,
+                status="failed",
+                error_message="Insufficient resources",
             )
-            self.running_tasks[task_id] = running_task
-            
-            # Report START with fencing token
+            return
+        
+        # Allocate resources
+        self.allocate(resources)
+        
+        # Create task record
+        running_task = RunningTask(
+            task_id=task_id,
+            fencing_token=fencing_token,
+            lease_expiry_index=lease_expiry_index,
+            started_at=asyncio.get_event_loop().time(),
+            resources=resources,
+        )
+        self.running_tasks[task_id] = running_task
+        
+        try:
+            # Report START
             await self._report_status(
                 task_id=task_id,
                 fencing_token=fencing_token,
                 status="running",
             )
             
-            # Wait for completion with lease monitoring
-            exit_code = await self._wait_with_lease_monitoring(task_id, process)
+            # Start the process
+            process, container_id = await self._start_container(
+                image=image,
+                args=args,
+                env=env,
+                gpu_count=resources.get("gpu_count", 0),
+                task_id=task_id,
+            )
+            
+            running_task.process = process
+            running_task.container_id = container_id
+            
+            # Start lease monitor
+            lease_monitor = asyncio.create_task(
+                self._monitor_lease(task_id, fencing_token)
+            )
+            
+            # Wait for completion
+            exit_code = await process.wait()
+            
+            # Cancel lease monitor
+            lease_monitor.cancel()
+            try:
+                await lease_monitor
+            except asyncio.CancelledError:
+                pass
             
             # Report completion
             if exit_code == 0:
@@ -259,12 +389,12 @@ class WorkerDaemon:
                 )
         
         except asyncio.CancelledError:
-            # Task was cancelled (lease expired or connection lost)
+            # Task was cancelled
             await self._report_status(
                 task_id=task_id,
                 fencing_token=fencing_token,
-                status="orphaned",
-                error_message="Task killed due to lease expiry or connection loss",
+                status="failed",
+                error_message="Task cancelled (lease expired or connection lost)",
             )
         
         except Exception as e:
@@ -276,99 +406,113 @@ class WorkerDaemon:
             )
         
         finally:
+            # Release resources
+            self.release(resources)
+            
             # Remove from running tasks
             self.running_tasks.pop(task_id, None)
     
-    async def _start_process(
-        self, 
-        image: str, 
-        args: List[str], 
-        env: List[str]
-    ) -> asyncio.subprocess.Process:
-        """Start a process for the task."""
-        if self.runtime == "docker":
-            cmd = ["docker", "run", "--rm"]
-            for e in env:
-                cmd.extend(["-e", e])
-            cmd.append(image)
-            cmd.extend(args)
-        else:
-            cmd = [image] + args
+    async def _start_container(
+        self,
+        image: str,
+        args: List[str],
+        env: List[str],
+        gpu_count: int,
+        task_id: str,
+    ) -> tuple:
+        """Start a Docker container."""
+        container_name = f"aether-{task_id.replace(':', '-')}"
         
-        env_dict = os.environ.copy()
+        cmd = ["docker", "run", "--rm", "--name", container_name]
+        
+        # Environment
         for e in env:
-            if "=" in e:
-                key, value = e.split("=", 1)
-                env_dict[key] = value
+            cmd.extend(["-e", e])
+        
+        # GPU support
+        if gpu_count > 0 and self.gpu_count >= gpu_count:
+            cmd.extend(["--gpus", str(gpu_count)])
+            print(f"[Worker] Allocating {gpu_count} GPU(s) for task {task_id}")
+        
+        # Memory limit
+        if self.memory_mb:
+            cmd.extend(["--memory", f"{self.memory_mb}m"])
+        
+        cmd.append(image)
+        cmd.extend(args)
+        
+        print(f"[Worker] Starting: {' '.join(cmd)}")
         
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=env_dict,
         )
         
-        return process
-    
-    async def _wait_with_lease_monitoring(
-        self,
-        task_id: str,
-        process: asyncio.subprocess.Process,
-    ) -> int:
-        """
-        Wait for process with lease monitoring.
+        # Get container ID
+        await asyncio.sleep(0.5)
+        container_id = container_name
         
-        CRITICAL: This monitors the lease and kills the process if:
-        1. Lease expires (cluster_log_index >= lease_expiry_index)
-        2. Connection to cluster is lost
-        """
+        return process, container_id
+    
+    async def _monitor_lease(self, task_id: str, fencing_token: int) -> None:
+        """Monitor lease expiry for a task."""
         running_task = self.running_tasks.get(task_id)
         if not running_task:
-            return -1
+            return
         
-        while True:
-            # Check if process is done
-            if process.returncode is not None:
-                return process.returncode
+        while self._running:
+            # Check lease expiry
+            if self.cluster_log_index >= running_task.lease_expiry_index:
+                print(f"[Worker] Lease expired for task {task_id}")
+                await self._kill_task(task_id)
+                return
             
             # Check connection
             if not self._connected:
-                print(f"Connection lost, killing task {task_id}")
-                await self._kill_process(process)
-                raise asyncio.CancelledError("Connection lost")
+                print(f"[Worker] Connection lost, killing task {task_id}")
+                await self._kill_task(task_id)
+                return
             
-            # Check lease expiry
-            if self.cluster_log_index >= running_task.lease_expiry_index:
-                print(f"Lease expired for task {task_id}")
-                await self._kill_process(process)
-                raise asyncio.CancelledError("Lease expired")
-            
-            # Wait a bit before checking again
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(1.0)
     
-    async def _kill_process(self, process: asyncio.subprocess.Process) -> None:
-        """Kill a process gracefully."""
-        try:
-            process.terminate()
-            await asyncio.sleep(1)
-            if process.returncode is None:
-                process.kill()
-                await process.wait()
-        except Exception:
-            pass
-    
-    async def _kill_task(self, task_id: str, reason: str) -> None:
-        """Kill a specific running task."""
+    async def _kill_task(self, task_id: str) -> None:
+        """Kill a running task."""
         running_task = self.running_tasks.get(task_id)
-        if running_task and running_task.process:
-            print(f"Killing task {task_id}: {reason}")
-            await self._kill_process(running_task.process)
+        if not running_task:
+            return
+        
+        # Kill Docker container
+        if running_task.container_id:
+            try:
+                subprocess.run(
+                    ["docker", "kill", running_task.container_id],
+                    capture_output=True,
+                    timeout=10
+                )
+                subprocess.run(
+                    ["docker", "rm", "-f", running_task.container_id],
+                    capture_output=True,
+                    timeout=10
+                )
+            except Exception as e:
+                print(f"[Worker] Error killing container: {e}")
+        
+        # Kill process
+        if running_task.process and running_task.process.returncode is None:
+            try:
+                running_task.process.terminate()
+                await asyncio.sleep(1)
+                if running_task.process.returncode is None:
+                    running_task.process.kill()
+            except Exception:
+                pass
     
     async def _kill_all_tasks(self, reason: str) -> None:
         """Kill all running tasks."""
-        print(f"Killing all tasks: {reason}")
+        print(f"[Worker] Killing all tasks: {reason}")
         for task_id in list(self.running_tasks.keys()):
-            await self._kill_task(task_id, reason)
+            await self._kill_task(task_id)
     
     # ========== Status Reporting ==========
     
@@ -380,136 +524,78 @@ class WorkerDaemon:
         exit_code: int = 0,
         error_message: str = "",
     ) -> bool:
-        """
-        Report task status to the cluster.
-        
-        CRITICAL: The fencing token MUST be valid for the report to be accepted.
-        """
-        if not self._connected:
+        """Report task status to leader."""
+        if not self._connected or not self._worker_stub:
             return False
         
-        report = {
-            "task_id": task_id,
-            "node_id": self.node_id,
-            "fencing_token": fencing_token,
-            "status": status,
-            "exit_code": exit_code,
-            "error_message": error_message,
-        }
-        
-        # In production, this would be a gRPC call
-        print(f"Reporting status: {report}")
-        return True
-    
-    # ========== Heartbeat and Lease Management ==========
-    
-    async def _heartbeat_loop(self) -> None:
-        """Send periodic heartbeats to the cluster."""
-        while self._running:
-            try:
-                await self._send_heartbeat()
-                await asyncio.sleep(self.HEARTBEAT_INTERVAL)
-            except Exception as e:
-                print(f"Heartbeat failed: {e}")
-                await asyncio.sleep(1.0)
-    
-    async def _send_heartbeat(self) -> None:
-        """Send heartbeat to cluster and receive current log index."""
-        if not self._connected:
-            return
-        
-        heartbeat = {
-            "node_id": self.node_id,
-            "running_tasks": list(self.running_tasks.keys()),
-            "current_log_index": self.cluster_log_index,
-        }
-        
-        # In production, this would be a gRPC call
-        # For now, simulate receiving the cluster log index
-        # response = await stub.Heartbeat(heartbeat)
-        # self.cluster_log_index = response.cluster_log_index
-        
-        self.last_heartbeat_time = asyncio.get_event_loop().time()
-    
-    async def _lease_renewal_loop(self) -> None:
-        """Renew leases for running tasks before they expire."""
-        while self._running:
-            try:
-                for task_id, running_task in list(self.running_tasks.items()):
-                    # Check if lease needs renewal
-                    remaining = running_task.lease_expiry_index - self.cluster_log_index
-                    
-                    if remaining < self.LEASE_RENEWAL_MARGIN:
-                        await self._renew_lease(task_id, running_task)
-                
-                await asyncio.sleep(1.0)
+        try:
+            from ..generated import aethergrid_pb2
             
-            except Exception as e:
-                print(f"Lease renewal error: {e}")
-    
-    async def _renew_lease(self, task_id: str, running_task: RunningTask) -> bool:
-        """Request lease renewal for a task."""
-        if not self._connected:
+            # Map status string to enum
+            status_map = {
+                "running": aethergrid_pb2.TASK_STATUS_RUNNING,
+                "succeeded": aethergrid_pb2.TASK_STATUS_SUCCEEDED,
+                "failed": aethergrid_pb2.TASK_STATUS_FAILED,
+            }
+            
+            # Parse task_id
+            parts = task_id.split(":")
+            if len(parts) == 2:
+                tid = aethergrid_pb2.TaskID(
+                    shard=int(parts[0]),
+                    sequence=int(parts[1]),
+                )
+            else:
+                return False
+            
+            request = aethergrid_pb2.TaskStatusReport(
+                task_id=tid,
+                fencing_token=fencing_token,
+                status=status_map.get(status, aethergrid_pb2.TASK_STATUS_RUNNING),
+                exit_code=exit_code,
+                error_message=error_message,
+            )
+            
+            response = await self._worker_stub.ReportStatus(request)
+            
+            if response.accepted:
+                print(f"[Worker] Status reported: {status}")
+                return True
+            else:
+                print(f"[Worker] Status rejected: {response.rejection_reason}")
+                return False
+                
+        except Exception as e:
+            print(f"[Worker] Failed to report status: {e}")
             return False
-        
-        request = {
-            "task_id": task_id,
-            "node_id": self.node_id,
-            "fencing_token": running_task.fencing_token,
-            "additional_entries": 1000,  # Extend by 1000 log entries
-        }
-        
-        # In production, this would be a gRPC call
-        print(f"Requesting lease renewal for {task_id}")
-        return True
-    
-    async def _connection_monitor(self) -> None:
-        """Monitor connection health and kill tasks if connection lost."""
-        while self._running:
-            now = asyncio.get_event_loop().time()
-            
-            # Check if connection has timed out
-            if self._connected:
-                time_since_heartbeat = now - self.last_heartbeat_time
-                
-                if time_since_heartbeat > self.CONNECTION_TIMEOUT:
-                    print("Connection timeout detected")
-                    await self.disconnect()
-            
-            await asyncio.sleep(1.0)
-    
-    # ========== Public API ==========
-    
-    def submit_assignment(self, assignment: dict) -> None:
-        """Submit an assignment to this worker (for testing)."""
-        self._assignment_queue.put_nowait(assignment)
-    
-    def update_cluster_log_index(self, index: int) -> None:
-        """Update the cluster log index (for testing)."""
-        self.cluster_log_index = index
     
     # ========== Main Loop ==========
     
     async def run(self) -> None:
-        """Main event loop for the worker daemon."""
+        """Main event loop."""
         self._running = True
         
-        # Graceful shutdown on signals
+        # Setup signal handlers
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, lambda: self.stop())
         
         # Connect to cluster
+        if not await self.connect():
+            print("[Worker] Failed to connect to cluster")
+            return
+        
+        # Register with cluster
+        if not await self.register():
+            print("[Worker] Failed to register with cluster")
+            return
         
         self.state = WorkerState.RUNNING
+        print(f"[Worker] Running with {self.gpu_count} GPUs, {self.gpu_memory_mb}MB VRAM")
         
-        # Start background tasks
-        self._tasks = [
-            asyncio.create_task(self._stream_assignments()),
-            asyncio.create_task(self._heartbeat_loop()),
-            asyncio.create_task(self._lease_renewal_loop()),
-            asyncio.create_task(self._connection_monitor()),
-        ]
+        # Start heartbeat loop
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._tasks.append(heartbeat_task)
         
         # Wait for shutdown
         try:
@@ -523,46 +609,60 @@ class WorkerDaemon:
             task.cancel()
         
         await asyncio.gather(*self._tasks, return_exceptions=True)
-        
-        # Kill all running tasks
         await self._kill_all_tasks("Worker shutting down")
-        
-        # Disconnect
         await self.disconnect()
     
     def stop(self) -> None:
-        """Stop the worker daemon."""
+        """Stop the worker."""
         self._running = False
+        self.state = WorkerState.STOPPED
 
 
-# ============== Standalone Entry Point ==============
+# ============== CLI Entry Point ==============
 
-async def main():
-    """Run a worker daemon standalone."""
+def run_worker():
+    """Run a standalone worker from CLI."""
     import argparse
     
     parser = argparse.ArgumentParser(description="AetherGrid Worker Daemon")
     parser.add_argument("--node-id", required=True, help="Unique node ID")
-    parser.add_argument("--cluster", default="localhost:50051", help="Cluster address")
-    parser.add_argument("--hostname", default=None, help="Hostname")
-    parser.add_argument("--runtime", default="docker", help="Runtime (docker/process)")
-    parser.add_argument("--data-dir", default="/tmp/aethergrid/worker", help="Data directory")
+    parser.add_argument("--cluster", default="localhost:50051", help="Cluster address (host:port)")
+    parser.add_argument("--hostname", default=None, help="Hostname (auto-detected if not set)")
+    parser.add_argument("--cpu", type=int, default=4000, help="CPU capacity in milli-cores")
+    parser.add_argument("--memory", type=int, default=8192, help="Memory capacity in MB")
+    parser.add_argument("--gpu-count", type=int, default=0, help="Number of GPUs")
+    parser.add_argument("--gpu-memory", type=int, default=0, help="GPU memory in MB")
+    parser.add_argument("--runtime", default="docker", choices=["docker", "process"], help="Runtime type")
+    parser.add_argument("--labels", default="", help="Comma-separated labels (key=value)")
     
     args = parser.parse_args()
     
+    # Parse labels
+    labels = {}
+    if args.labels:
+        for label in args.labels.split(","):
+            if "=" in label:
+                k, v = label.split("=", 1)
+                labels[k.strip()] = v.strip()
+    
+    # Create and run worker
     daemon = WorkerDaemon(
         node_id=args.node_id,
         cluster_address=args.cluster,
         hostname=args.hostname,
+        cpu_millis=args.cpu,
+        memory_mb=args.memory,
+        gpu_count=args.gpu_count,
+        gpu_memory_mb=args.gpu_memory,
+        labels=labels,
         runtime=args.runtime,
-        data_dir=args.data_dir,
     )
     
     try:
-        await daemon.run()
+        asyncio.run(daemon.run())
     except KeyboardInterrupt:
         daemon.stop()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run_worker()

@@ -464,6 +464,11 @@ class WorkerServiceStub(object):
                 request_serializer=aethergrid__pb2.HeartbeatRequest.SerializeToString,
                 response_deserializer=aethergrid__pb2.HeartbeatResponse.FromString,
                 _registered_method=True)
+        self.ReportCheckpoint = channel.unary_unary(
+                '/aethergrid.WorkerService/ReportCheckpoint',
+                request_serializer=aethergrid__pb2.CheckpointReport.SerializeToString,
+                response_deserializer=aethergrid__pb2.CheckpointReportResponse.FromString,
+                _registered_method=True)
 
 
 class WorkerServiceServicer(object):
@@ -488,6 +493,12 @@ class WorkerServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ReportCheckpoint(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_WorkerServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -505,6 +516,11 @@ def add_WorkerServiceServicer_to_server(servicer, server):
                     servicer.Heartbeat,
                     request_deserializer=aethergrid__pb2.HeartbeatRequest.FromString,
                     response_serializer=aethergrid__pb2.HeartbeatResponse.SerializeToString,
+            ),
+            'ReportCheckpoint': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReportCheckpoint,
+                    request_deserializer=aethergrid__pb2.CheckpointReport.FromString,
+                    response_serializer=aethergrid__pb2.CheckpointReportResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -589,6 +605,33 @@ class WorkerService(object):
             '/aethergrid.WorkerService/Heartbeat',
             aethergrid__pb2.HeartbeatRequest.SerializeToString,
             aethergrid__pb2.HeartbeatResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReportCheckpoint(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/aethergrid.WorkerService/ReportCheckpoint',
+            aethergrid__pb2.CheckpointReport.SerializeToString,
+            aethergrid__pb2.CheckpointReportResponse.FromString,
             options,
             channel_credentials,
             insecure,

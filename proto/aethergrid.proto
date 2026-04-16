@@ -28,7 +28,8 @@ message ResourceSpec {
     int64 cpu_millis = 1;      // CPU in milli-cores (1000 = 1 CPU)
     int64 memory_bytes = 2;    // Memory in bytes
     int64 gpu_count = 3;       // Number of GPUs
-    map<string, string> extended = 4;  // Extended resources
+    int64 gpu_memory_mb = 4;   // GPU memory in megabytes
+    map<string, string> extended = 5;  // Extended resources
 }
 
 // Placement constraints for task scheduling
@@ -67,21 +68,28 @@ message Task {
     PlacementConstraints constraints = 14;   // Placement constraints
     uint64 ttl_log_entries = 15;             // TTL in log entries (deterministic time)
     int32 max_retries = 16;                  // Max retry attempts
+    int32 priority = 20;                     // Task priority (higher = more important)
     
     // Status
-    TaskStatus status = 20;
-    NodeID assigned_node = 21;
-    uint64 created_at_index = 22;            // Log index when created (deterministic time)
-    uint64 scheduled_at_index = 23;          // Log index when scheduled
-    uint64 started_at_index = 24;            // Log index when started
-    uint64 finished_at_index = 25;           // Log index when finished
-    int32 exit_code = 26;
-    string error_message = 27;
-    int32 retry_count = 28;
+    TaskStatus status = 21;
+    NodeID assigned_node = 22;
+    uint64 created_at_index = 23;            // Log index when created (deterministic time)
+    uint64 scheduled_at_index = 24;          // Log index when scheduled
+    uint64 started_at_index = 25;            // Log index when started
+    uint64 finished_at_index = 26;           // Log index when finished
+    int32 exit_code = 27;
+    string error_message = 28;
+    int32 retry_count = 29;
     
     // Fencing token for zombie worker protection
     uint64 fencing_token = 30;               // Monotonically increasing per task
     uint64 lease_expiry_index = 31;          // Log index when lease expires
+    
+    // Checkpoint tracking for long-running AI jobs
+    string checkpoint_url = 32;              // URL to latest checkpoint (e.g., s3://bucket/checkpoint.pt)
+    uint64 checkpoint_index = 33;            // Training step/epoch at last checkpoint
+    uint64 checkpoint_log_index = 34;        // Log index when checkpoint was reported
+    map<string, string> checkpoint_metadata = 35; // Checkpoint metadata (metrics, etc.)
     
     // Metadata
     map<string, string> labels = 40;
@@ -131,6 +139,8 @@ message Command {
         RegisterNodeCommand register_node = 10;
         UpdateNodeHeartbeatCommand update_heartbeat = 11;
         DeregisterNodeCommand deregister_node = 12;
+        PreemptTaskCommand preempt_task = 13;
+        CheckpointTaskCommand checkpoint_task = 14;
     }
 }
 
@@ -146,6 +156,7 @@ message SubmitTaskCommand {
     int32 max_retries = 9;
     map<string, string> labels = 10;
     string submitted_by = 11;
+    int32 priority = 20;         // Task priority (higher = more important)
 }
 
 message ScheduleTaskCommand {
@@ -219,6 +230,21 @@ message UpdateNodeHeartbeatCommand {
 message DeregisterNodeCommand {
     NodeID node_id = 1;
     string reason = 2;
+}
+
+message PreemptTaskCommand {
+    TaskID task_to_preempt = 1;      // The low-priority task to kill
+    TaskID high_priority_task = 2;   // The high-priority task that triggered preemption
+    string reason = 3;               // Reason for preemption
+}
+
+message CheckpointTaskCommand {
+    TaskID task_id = 1;              // The task being checkpointed
+    NodeID node_id = 2;              // Worker node reporting the checkpoint
+    uint64 fencing_token = 3;        // Must match current token
+    string checkpoint_url = 4;       // URL/path to the checkpoint (e.g., s3://bucket/checkpoint.pt)
+    uint64 checkpoint_index = 5;     // Training step/epoch at checkpoint time
+    map<string, string> metadata = 6; // Additional checkpoint metadata (metrics, etc.)
 }
 
 // ============== Node Health ==============
@@ -350,6 +376,7 @@ message SubmitTaskRequest {
     repeated string env = 5;
     ResourceSpec resources = 6;
     map<string, string> labels = 7;
+    int32 priority = 20;                     // Task priority (higher = more important)
 }
 
 message SubmitTaskResponse {
@@ -409,6 +436,7 @@ service WorkerService {
     rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
     rpc ReportStatus(TaskStatusReport) returns (TaskStatusReportResponse);
     rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+    rpc ReportCheckpoint(CheckpointReport) returns (CheckpointReportResponse);
 }
 
 message RegisterNodeRequest {
@@ -432,4 +460,19 @@ message HeartbeatRequest {
 
 message HeartbeatResponse {
     bool acknowledged = 1;
+}
+
+// Checkpoint reporting for long-running AI jobs
+message CheckpointReport {
+    TaskID task_id = 1;
+    uint64 fencing_token = 2;
+    string checkpoint_url = 3;           // URL/path to checkpoint (e.g., s3://bucket/checkpoint.pt)
+    uint64 checkpoint_index = 4;         // Training step/epoch at checkpoint
+    map<string, string> metadata = 5;    // Additional metadata (metrics, loss, etc.)
+}
+
+message CheckpointReportResponse {
+    bool accepted = 1;
+    string rejection_reason = 2;
+    uint64 current_log_index = 3;        // Leader's current log index for timing
 }

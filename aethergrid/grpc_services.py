@@ -183,6 +183,7 @@ class TaskServiceServicer(aethergrid_pb2_grpc.TaskServiceServicer):
             "args": list(request.args),
             "env": list(request.env),
             "labels": dict(request.labels),
+            "priority": request.priority,
         }
         
         # Submit to Raft
@@ -349,6 +350,10 @@ class TaskServiceServicer(aethergrid_pb2_grpc.TaskServiceServicer):
             error_message=task.error_message,
             fencing_token=task.fencing_token,
             labels=task.labels,
+            priority=task.priority,
+            checkpoint_url=task.checkpoint_url,
+            checkpoint_index=task.checkpoint_index,
+            checkpoint_log_index=task.checkpoint_log_index,
         )
         
         if task.assigned_node:
@@ -465,6 +470,45 @@ class WorkerServiceServicer(aethergrid_pb2_grpc.WorkerServiceServicer):
     ) -> aethergrid_pb2.HeartbeatResponse:
         """Handle worker heartbeat."""
         return aethergrid_pb2.HeartbeatResponse(acknowledged=True)
+    
+    async def ReportCheckpoint(
+        self,
+        request: aethergrid_pb2.CheckpointReport,
+        context: grpc.aio.ServicerContext,
+    ) -> aethergrid_pb2.CheckpointReportResponse:
+        """Handle checkpoint report from worker for long-running AI jobs."""
+        if not self._is_leader():
+            return aethergrid_pb2.CheckpointReportResponse(
+                accepted=False,
+                rejection_reason="Not the leader",
+            )
+        
+        # Build checkpoint command
+        command = {
+            "type": "checkpoint_task",
+            "task_id": {
+                "shard": request.task_id.shard,
+                "sequence": request.task_id.sequence,
+            },
+            "node_id": {"id": context.peer()},
+            "fencing_token": request.fencing_token,
+            "checkpoint_url": request.checkpoint_url,
+            "checkpoint_index": request.checkpoint_index,
+            "metadata": dict(request.metadata),
+        }
+        
+        success, result = await self.raft_node.submit_command(command)
+        
+        if not success:
+            return aethergrid_pb2.CheckpointReportResponse(
+                accepted=False,
+                rejection_reason=str(result),
+            )
+        
+        return aethergrid_pb2.CheckpointReportResponse(
+            accepted=True,
+            current_log_index=self.state_machine.current_log_index,
+        )
     
     def _is_leader(self) -> bool:
         """Check if this node is the leader."""

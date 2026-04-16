@@ -5,6 +5,8 @@ The Worker Agent runs on worker nodes and:
 2. Validates fencing tokens before executing tasks
 3. Reports task status with fencing tokens
 4. Handles lease renewals to keep tasks running
+5. Supports Docker container execution with GPU passthrough
+6. Monitors lease expiry and kills containers when expired
 
 Key security feature:
 - Workers must present valid fencing tokens to update task state
@@ -16,10 +18,12 @@ import subprocess
 import os
 import signal
 import json
+import shutil
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Callable
+from typing import Any, Dict, List, Optional, Set, Callable, Tuple
 from enum import Enum
 
 
@@ -30,9 +34,11 @@ class TaskHandle:
     fencing_token: int
     lease_expiry_index: int
     process: Optional[subprocess.Popen] = None
+    container_id: Optional[str] = None  # Docker container ID
     started_at: float = 0.0
     stdout_buffer: List[bytes] = field(default_factory=list)
     stderr_buffer: List[bytes] = field(default_factory=list)
+    lease_monitor_task: Optional[asyncio.Task] = None
 
 
 class WorkerAgent:
@@ -45,6 +51,8 @@ class WorkerAgent:
     3. Validates fencing tokens before execution
     4. Reports status with fencing tokens
     5. Handles lease renewals
+    6. Supports Docker execution with GPU passthrough
+    7. Monitors lease expiry and kills containers
     
     Fencing Token Protocol:
     - Each task assignment includes a fencing token
@@ -61,6 +69,8 @@ class WorkerAgent:
         send_to_leader: Callable[[dict], None],
         labels: Optional[Dict[str, str]] = None,
         runtime: str = "docker",
+        gpu_count: int = 0,
+        gpu_memory_mb: int = 0,
     ):
         self.node_id = node_id
         self.hostname = hostname
@@ -68,6 +78,8 @@ class WorkerAgent:
         self.send_to_leader = send_to_leader
         self.labels = labels or {}
         self.runtime = runtime
+        self.gpu_count = gpu_count
+        self.gpu_memory_mb = gpu_memory_mb
         
         # Running tasks (task_id -> TaskHandle)
         self.running_tasks: Dict[str, TaskHandle] = {}
@@ -80,6 +92,26 @@ class WorkerAgent:
         
         # Running flag
         self._running: bool = False
+        
+        # Docker availability check
+        self._docker_available: Optional[bool] = None
+    
+    def _check_docker_available(self) -> bool:
+        """Check if Docker is available on this system."""
+        if self._docker_available is not None:
+            return self._docker_available
+        
+        try:
+            result = subprocess.run(
+                ["docker", "version"],
+                capture_output=True,
+                timeout=5
+            )
+            self._docker_available = result.returncode == 0
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            self._docker_available = False
+        
+        return self._docker_available
     
     # ========== Task Assignment ==========
     
@@ -124,6 +156,8 @@ class WorkerAgent:
         image = assignment.get("image", "")
         args = assignment.get("args", [])
         env = assignment.get("env", [])
+        resources = assignment.get("resources", {})
+        gpu_count = resources.get("gpu_count", 0)
         
         # Create handle
         handle = TaskHandle(
@@ -142,18 +176,45 @@ class WorkerAgent:
         )
         
         try:
-            # Execute task based on runtime
-            if self.runtime == "docker":
-                process = await self._run_docker(image, args, env)
-            elif self.runtime == "process":
+            # Execute task based on runtime and image type
+            if self.runtime == "docker" and self._check_docker_available():
+                # Use Docker for containerized execution
+                if ":" in image or "/" in image or image.startswith("sha256:"):
+                    # Looks like a Docker image reference
+                    process, container_id = await self._run_docker(
+                        image=image,
+                        args=args,
+                        env=env,
+                        gpu_count=gpu_count,
+                        task_id=task_id,
+                    )
+                    handle.container_id = container_id
+                else:
+                    # Fall back to process execution for local commands
+                    process = await self._run_process(image, args, env)
+                handle.process = process
+            elif self.runtime == "process" or not self._check_docker_available():
+                # Native process execution
                 process = await self._run_process(image, args, env)
+                handle.process = process
             else:
                 raise ValueError(f"Unknown runtime: {self.runtime}")
             
-            handle.process = process
+            # Start lease monitor task
+            handle.lease_monitor_task = asyncio.create_task(
+                self._monitor_lease(task_id, fencing_token)
+            )
             
             # Wait for completion
             exit_code = await process.wait()
+            
+            # Cancel lease monitor
+            if handle.lease_monitor_task:
+                handle.lease_monitor_task.cancel()
+                try:
+                    await handle.lease_monitor_task
+                except asyncio.CancelledError:
+                    pass
             
             # Report completion with fencing token
             if exit_code == 0:
@@ -172,6 +233,16 @@ class WorkerAgent:
                     error_message=f"Process exited with code {exit_code}",
                 )
         
+        except asyncio.CancelledError:
+            # Task was cancelled (lease expired or external cancel)
+            await self._kill_container(handle)
+            await self._report_status(
+                task_id=task_id,
+                fencing_token=fencing_token,
+                status="failed",
+                error_message="Task cancelled (lease expired or external cancel)",
+            )
+        
         except Exception as e:
             # Report failure with fencing token
             await self._report_status(
@@ -186,21 +257,111 @@ class WorkerAgent:
             if task_id in self.running_tasks:
                 del self.running_tasks[task_id]
     
+    async def _monitor_lease(self, task_id: str, fencing_token: int) -> None:
+        """
+        Monitor lease expiry for a running task.
+        
+        If the lease expires, the task is killed to prevent
+        zombie workers from continuing execution.
+        """
+        handle = self.running_tasks.get(task_id)
+        if not handle:
+            return
+        
+        while self._running:
+            # Check if lease has expired
+            if self.current_log_index >= handle.lease_expiry_index:
+                # Lease expired - kill the container
+                print(f"[Worker] Lease expired for task {task_id}, killing container")
+                await self._kill_container(handle)
+                return
+            
+            # Wait before next check
+            await asyncio.sleep(1.0)
+    
+    async def _kill_container(self, handle: TaskHandle) -> None:
+        """Kill a Docker container or process."""
+        if handle.container_id:
+            # Kill Docker container
+            try:
+                subprocess.run(
+                    ["docker", "kill", handle.container_id],
+                    capture_output=True,
+                    timeout=10
+                )
+                # Remove the container
+                subprocess.run(
+                    ["docker", "rm", "-f", handle.container_id],
+                    capture_output=True,
+                    timeout=10
+                )
+            except (subprocess.TimeoutExpired, Exception) as e:
+                print(f"[Worker] Error killing container: {e}")
+        
+        if handle.process and handle.process.returncode is None:
+            try:
+                handle.process.terminate()
+                await asyncio.sleep(1)
+                if handle.process.returncode is None:
+                    handle.process.kill()
+            except Exception as e:
+                print(f"[Worker] Error killing process: {e}")
+    
     async def _run_docker(
         self, 
         image: str, 
         args: List[str], 
-        env: List[str]
-    ) -> asyncio.subprocess.Process:
-        """Run task in Docker container."""
-        cmd = ["docker", "run", "--rm"]
+        env: List[str],
+        gpu_count: int = 0,
+        task_id: str = "",
+    ) -> Tuple[asyncio.subprocess.Process, str]:
+        """
+        Run task in Docker container with optional GPU support.
+        
+        Args:
+            image: Docker image name
+            args: Command arguments
+            env: Environment variables (KEY=VALUE format)
+            gpu_count: Number of GPUs to allocate
+            task_id: Task ID for container naming
+        
+        Returns:
+            Tuple of (process handle, container_id)
+        """
+        # Generate unique container name
+        container_name = f"aether-{task_id.replace(':', '-')}"
+        
+        cmd = ["docker", "run", "--rm", "--name", container_name]
         
         # Add environment variables
         for e in env:
             cmd.extend(["-e", e])
         
+        # Add GPU support if requested and available
+        if gpu_count > 0:
+            if self.gpu_count >= gpu_count:
+                # Use NVIDIA runtime for GPU access
+                if gpu_count == 1:
+                    cmd.extend(["--gpus", "1"])
+                else:
+                    cmd.extend(["--gpus", str(gpu_count)])
+                print(f"[Worker] Allocating {gpu_count} GPU(s) for task {task_id}")
+            else:
+                raise ValueError(
+                    f"Requested {gpu_count} GPUs but only {self.gpu_count} available"
+                )
+        
+        # Add resource limits if specified
+        if self.capacity.get("memory_mb"):
+            cmd.extend(["--memory", f"{self.capacity['memory_mb']}m"])
+        
+        # Add the image
         cmd.append(image)
+        
+        # Add command arguments
         cmd.extend(args)
+        
+        print(f"[Worker] Starting Docker container: {' '.join(cmd)}")
         
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -208,7 +369,20 @@ class WorkerAgent:
             stderr=asyncio.subprocess.PIPE,
         )
         
-        return process
+        # Get container ID from docker inspect
+        await asyncio.sleep(0.5)  # Wait for container to start
+        try:
+            result = subprocess.run(
+                ["docker", "ps", "-q", "-f", f"name={container_name}"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            container_id = result.stdout.strip()
+        except Exception:
+            container_id = container_name  # Fallback to name
+        
+        return process, container_id
     
     async def _run_process(
         self, 
@@ -348,8 +522,16 @@ class WorkerAgent:
     # ========== Heartbeat ==========
     
     async def send_heartbeat(self) -> None:
-        """Send heartbeat to leader with running tasks."""
+        """Send heartbeat to leader with running tasks and GPU allocation."""
         running_task_ids = list(self.running_tasks.keys())
+        
+        # Calculate allocated GPUs
+        allocated_gpus = 0
+        for task_id in running_task_ids:
+            handle = self.running_tasks.get(task_id)
+            if handle:
+                # This is simplified - in production, track per-task GPU allocation
+                pass
         
         heartbeat = {
             "type": "NodeHeartbeat",
@@ -357,6 +539,8 @@ class WorkerAgent:
             "running_tasks": running_task_ids,
             "current_log_index": self.current_log_index,
             "health": "healthy",
+            "gpu_available": self.gpu_count,
+            "gpu_memory_available_mb": self.gpu_memory_mb,
         }
         
         self.send_to_leader(heartbeat)
@@ -412,7 +596,11 @@ class WorkerAgent:
             "type": "RegisterNode",
             "node_id": self.node_id,
             "hostname": self.hostname,
-            "capacity": self.capacity,
+            "capacity": {
+                **self.capacity,
+                "gpu_count": self.gpu_count,
+                "gpu_memory_mb": self.gpu_memory_mb,
+            },
             "labels": self.labels,
             "runtimes": [self.runtime],
         }

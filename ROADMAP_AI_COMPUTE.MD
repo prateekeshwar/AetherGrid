@@ -374,3 +374,233 @@ aethergrid/
 └── worker/                 # Worker agent (enhance)
     └── agent.py
 ```
+
+---
+
+## Future Phase: Enterprise AI Compute
+
+The following features are planned for future releases to support enterprise-scale AI workloads:
+
+### Multi-Region Scheduling
+
+**Goal:** Distribute training jobs across multiple data centers / cloud regions.
+
+**Key Features:**
+- Region-aware task placement with latency optimization
+- Cross-region state replication for disaster recovery
+- Federated learning support with region-local data
+- Cost-aware scheduling (spot instances, reserved capacity)
+- Network topology awareness for distributed training
+
+**Implementation:**
+```
+Region A (us-west)        Region B (us-east)        Region C (eu-west)
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│  Raft Leader    │◄────►│  Raft Follower  │◄────►│  Raft Follower  │
+│  + GPU Workers  │      │  + GPU Workers  │      │  + GPU Workers  │
+└─────────────────┘      └─────────────────┘      └─────────────────┘
+         │                       │                       │
+         └───────────────────────┴───────────────────────┘
+                    Async State Replication
+```
+
+**Proto Changes:**
+```protobuf
+message RegionSpec {
+    string region_id = 1;
+    string zone = 2;
+    double cost_per_gpu_hour = 3;
+    int32 latency_ms_to_region = 4;
+}
+
+message PlacementConstraints {
+    // ... existing fields ...
+    repeated string preferred_regions = 10;
+    repeated string anti_affinity_regions = 11;
+    bool require_same_region = 12;  // For distributed training
+}
+```
+
+---
+
+### Kubernetes Operator Integration
+
+**Goal:** Native Kubernetes deployment with CRDs for AetherGrid resources.
+
+**Key Features:**
+- `AetherTask` Custom Resource Definition for declarative job submission
+- `AetherWorker` CRD for worker node management
+- `AetherCluster` CRD for multi-node cluster deployment
+- Automatic horizontal scaling based on queue depth
+- Integration with Kubernetes GPU scheduling (device plugins)
+- Helm charts for one-command deployment
+
+**Example CRD:**
+```yaml
+apiVersion: aethergrid.io/v1
+kind: AetherTask
+metadata:
+  name: gpt4-finetune
+  namespace: ml-training
+spec:
+  image: pytorch/pytorch:2.0-cuda11.8
+  command: ["python", "train.py"]
+  resources:
+    gpuCount: 8
+    gpuMemoryMB: 80000  # 80GB A100s
+    cpuMillis: 32000
+    memoryBytes: 256Gi
+  priority: 100
+  checkpointInterval: 1000  # steps
+  maxRetries: 3
+  placement:
+    requiredLabels:
+      - "accelerator=a100"
+    preferredRegions:
+      - "us-west-2"
+```
+
+**Operator Architecture:**
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Kubernetes Cluster                        │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │              AetherGrid Operator                      │   │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐   │   │
+│  │  │ Task Ctrl   │  │Worker Ctrl  │  │Cluster Ctrl │   │   │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘   │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                          │                                   │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │                 Raft Leader Pod                       │   │
+│  │  ┌─────────────────────────────────────────────────┐ │   │
+│  │  │ State Machine | Scheduler | gRPC Services       │ │   │
+│  │  └─────────────────────────────────────────────────┘ │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                          │                                   │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐        │
+│  │ Worker 1 │ │ Worker 2 │ │ Worker 3 │ │ Worker N │        │
+│  │ (GPU)    │ │ (GPU)    │ │ (CPU)    │ │ (GPU)    │        │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Automatic GPU De-fragmentation
+
+**Goal:** Maximize GPU utilization by consolidating workloads and defragmenting GPU memory.
+
+**Problem:**
+```
+Before De-fragmentation:
+Node A: [GPU0: 70% used] [GPU1: 30% used] [GPU2: 50% used] [GPU3: 10% used]
+Node B: [GPU0: 20% used] [GPU1: 80% used] [GPU2: 40% used] [GPU3: 60% used]
+
+Result: Cannot schedule 8-GPU job (fragmented across nodes)
+```
+
+**Solution:**
+```
+After De-fragmentation:
+Node A: [GPU0: 100% used] [GPU1: 100% used] [GPU2: 100% used] [GPU3: 100% used]
+Node B: [GPU0: 0% used] [GPU1: 0% used] [GPU2: 0% used] [GPU3: 0% used]
+
+Result: 8-GPU job can now be scheduled on Node B
+```
+
+**Key Features:**
+- Live migration of GPU workloads (checkpoint + restore)
+- Predictive de-fragmentation based on job queue analysis
+- Cost-aware migration (minimize data transfer)
+- Multi-GPU job co-location optimization
+- Memory-aware scheduling for large models
+
+**Implementation:**
+```python
+class GPUScheduler:
+    def calculate_fragmentation_score(self, node: Node) -> float:
+        """Calculate GPU fragmentation score (0 = compact, 1 = fragmented)."""
+        if node.capacity.gpu_count == 0:
+            return 0.0
+        
+        utilization = []
+        for gpu_id in range(node.capacity.gpu_count):
+            used = node.allocated_gpu_memory.get(gpu_id, 0)
+            total = node.capacity.gpu_memory_mb
+            utilization.append(used / total)
+        
+        # Fragmentation = variance in utilization
+        mean_util = sum(utilization) / len(utilization)
+        variance = sum((u - mean_util) ** 2 for u in utilization) / len(utilization)
+        return variance
+    
+    def find_migration_candidates(self) -> List[Tuple[Task, Node]]:
+        """Find tasks that could be migrated to reduce fragmentation."""
+        candidates = []
+        for node in self.state_machine.nodes.values():
+            if self.calculate_fragmentation_score(node) > 0.3:
+                # Find small tasks that could be consolidated
+                for task_id in node.running_tasks:
+                    task = self.state_machine.tasks.get(task_id)
+                    if task and task.resources.gpu_count <= 2:
+                        candidates.append((task, node))
+        return candidates
+    
+    def plan_defragmentation(self) -> List[MigrationPlan]:
+        """Create a migration plan to reduce cluster fragmentation."""
+        plans = []
+        candidates = self.find_migration_candidates()
+        
+        # Group small tasks together
+        for task, source_node in candidates:
+            target_node = self.find_consolidation_target(task, source_node)
+            if target_node:
+                plans.append(MigrationPlan(
+                    task=task,
+                    source=source_node,
+                    target=target_node,
+                    estimated_downtime=task.checkpoint_index * 0.001,  # seconds
+                ))
+        
+        return plans
+```
+
+**Proto Changes:**
+```protobuf
+message DefragmentationPolicy {
+    bool enabled = 1;
+    float fragmentation_threshold = 2;  // Trigger at 30% fragmentation
+    int32 min_task_age_seconds = 3;     // Don't migrate new tasks
+    bool allow_preemption = 4;          // Preempt low-priority tasks
+    int32 max_concurrent_migrations = 5;
+}
+
+message MigrationPlan {
+    TaskID task_id = 1;
+    NodeID source_node = 2;
+    NodeID target_node = 3;
+    uint64 estimated_downtime_ms = 4;
+    string checkpoint_url = 5;
+}
+```
+
+---
+
+## Feature Status Summary
+
+| Feature | Status | Phase |
+|---------|--------|-------|
+| Docker execution | ✅ Complete | Phase 2 |
+| GPU resource tracking | ✅ Complete | Phase 3 |
+| Best-fit scheduling | ✅ Complete | Phase 3 |
+| Resource reclamation | ✅ Complete | Phase 3 |
+| Task priority | ✅ Complete | Phase 3 |
+| Task preemption | ✅ Complete | Phase 3 |
+| AI checkpointing | ✅ Complete | Phase 4 |
+| Cluster dashboard | ✅ Complete | Phase 4 |
+| Multi-node training | 🔄 Planned | Phase 4 |
+| Fault recovery | 🔄 Planned | Phase 5 |
+| Multi-region scheduling | 📋 Future | Phase 6 |
+| Kubernetes operator | 📋 Future | Phase 6 |
+| GPU de-fragmentation | 📋 Future | Phase 6 |
